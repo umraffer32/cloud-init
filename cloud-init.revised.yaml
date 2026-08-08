@@ -1,0 +1,257 @@
+#cloud-config
+hostname: devbox
+manage_etc_hosts: true
+preserve_hostname: false
+
+users:
+  - name: dev
+    groups: [sudo, adm]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: false
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBdIMlfyxWmZPMylyPkWRXJ/obDIRDesX6dS7m4TLXpa mrpocket@pickleboy
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFs7+oB1mLnCUj1EVQlZ8iAovxq5NozIzv5MgOLpwhZG uriah@SlicksPC
+
+package_update: true
+package_upgrade: false
+packages:
+  - qemu-guest-agent
+  - curl
+  - git
+  - nano
+  - htop
+  - tmux
+  - unzip
+  - net-tools
+  - dnsutils
+  - jq
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - software-properties-common
+  - python3-pip
+  - ansible
+  - unattended-upgrades
+
+# 4GB box. Docker builds and Packer are the memory spikes worth
+# insuring against, so swap exists as an OOM backstop, not as
+# routine capacity. See vm.swappiness in /etc/sysctl.d/99-devbox.conf.
+swap:
+  filename: /swapfile
+  size: 4G
+  maxsize: 4G
+
+runcmd:
+
+  # cloud-init reports only this script's final exit status, so without
+  # set -e a failure halfway through is hidden by whatever runs last
+  # and the box looks provisioned when it isn't.
+  - set -e
+
+  # Service hardening. The sshd settings live in
+  # /etc/ssh/sshd_config.d/10-devbox.conf (see write_files). Check the
+  # config before touching the daemon so a bad file can't take ssh down.
+  - systemctl enable --now qemu-guest-agent
+  - sshd -t
+  # try-reload-or-restart, not reload: 24.04 socket-activates ssh, so
+  # until the first connection there is no running service to reload.
+  - systemctl try-reload-or-restart ssh
+
+  # Terraform via HashiCorp's apt repo. Download and dearmor as two
+  # steps, not a pipeline: set -e only sees a pipeline's last command,
+  # so a failed download inside a pipe would slip through.
+  - curl -fsSL https://apt.releases.hashicorp.com/gpg -o /tmp/hashicorp.gpg
+  - gpg --dearmor --yes -o /usr/share/keyrings/hashicorp-archive-keyring.gpg /tmp/hashicorp.gpg
+  - rm /tmp/hashicorp.gpg
+  - echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" > /etc/apt/sources.list.d/hashicorp.list
+  - apt-get update
+  - apt-get install -y terraform packer
+
+  # AWS CLI v2 (official installer). --update so a re-provision
+  # upgrades in place instead of dying on the existing install.
+  - curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  - unzip -q -o /tmp/awscliv2.zip -d /tmp
+  - /tmp/aws/install --update
+  - rm -rf /tmp/awscliv2.zip /tmp/aws
+
+  # AWS Session Manager plugin (for Ansible aws_ssm connection).
+  # apt-get, not dpkg -i, so the lock timeout in 90devbox-apt-lock
+  # covers this install too.
+  - curl -fsSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o /tmp/session-manager-plugin.deb
+  - apt-get install -y /tmp/session-manager-plugin.deb
+  - rm /tmp/session-manager-plugin.deb
+
+  # GitHub CLI (official repo)
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL "https://cli.github.com/packages/githubcli-archive-keyring.gpg" -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+  - chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
+  - apt-get update
+  - apt-get install -y gh
+
+  # Docker Engine + Compose plugin (official repo)
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL "https://download.docker.com/linux/ubuntu/gpg" -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - systemctl enable --now docker
+  - usermod -aG docker dev
+
+  # Unattended upgrades: pin apt's daily timers to 2am, no random delay
+  - systemctl daemon-reload
+  - systemctl restart apt-daily.timer apt-daily-upgrade.timer
+
+  # systemd-sysctl already ran by the time cloud-init writes to
+  # /etc/sysctl.d, so apply the swappiness setting now rather than
+  # waiting for the next boot.
+  - sysctl --system
+
+timezone: America/Los_Angeles
+
+write_files:
+  # Ubuntu cloud images ship sshd_config.d/60-cloudimg-settings.conf,
+  # sshd keeps the first value it reads, and the Include sits at the
+  # top of sshd_config, so edits to sshd_config itself can lose to a
+  # snippet. A low-numbered drop-in wins over both the image's file
+  # and cloud-init's 50-cloud-init.conf.
+  - path: /etc/ssh/sshd_config.d/10-devbox.conf
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin no
+
+  # On first boot the stock apt timers are still in effect, Persistent
+  # and carrying a stamp from image build time, so unattended-upgrades
+  # often starts a catch-up run right at boot and holds the dpkg lock
+  # while cloud-init is installing packages. Wait for the lock instead
+  # of failing.
+  - path: /etc/apt/apt.conf.d/90devbox-apt-lock
+    content: |
+      DPkg::Lock::Timeout "300";
+
+  - path: /etc/apt/apt.conf.d/51unattended-upgrades-devbox
+    content: |
+      // apt merges lists across apt.conf.d files, so this extends the
+      // stock origins in 50unattended-upgrades (security and ESM stay
+      // allowed). The addition that matters here is -updates.
+      Unattended-Upgrade::Allowed-Origins {
+          "${distro_id}:${distro_codename}";
+          "${distro_id}:${distro_codename}-security";
+          "${distro_id}:${distro_codename}-updates";
+      };
+      Unattended-Upgrade::Remove-Unused-Dependencies "true";
+      Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+      Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+      // Patches install unattended, but the box never reboots itself.
+      // /etc/cron.d/reboot-check warns when a reboot is pending.
+      Unattended-Upgrade::Automatic-Reboot "false";
+
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Download-Upgradeable-Packages "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      APT::Periodic::AutocleanInterval "1";
+
+  - path: /etc/sysctl.d/99-devbox.conf
+    content: |
+      # Swap is a safety net for build spikes, not everyday storage.
+      # Default 60 swaps too eagerly for an interactive box; 10 keeps
+      # things in RAM until there's real pressure.
+      vm.swappiness = 10
+
+  - path: /etc/motd
+    content: |
+
+      ----------------------------------------------------------
+       devbox
+       provisioned by cloud-init
+      ----------------------------------------------------------
+
+       Tooling    Terraform, Packer, Ansible, Docker + Compose,
+                  AWS CLI v2, Session Manager plugin, gh
+
+       Patching   unattended-upgrades runs daily at 02:00. If the
+                  box was off at 02:00, the missed run fires at
+                  the next boot. Security and regular updates
+                  install on their own. Autoremove and autoclean
+                  are on.
+
+       Reboots    This box will NOT reboot itself. When a patch
+                  needs one it drops /var/run/reboot-required and
+                  waits for you. A 09:00 cron check reports how
+                  long it has been pending:
+
+                    journalctl -t reboot-check
+
+       Docker     Containers do not come back after a reboot
+                  unless you started them with
+                  --restart unless-stopped
+
+      ----------------------------------------------------------
+
+  - path: /usr/local/sbin/reboot-check
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      # Warn when unattended-upgrades has left a reboot pending.
+      # Silent when there's nothing to report.
+      [ -f /var/run/reboot-required ] || exit 0
+
+      pkgs=""
+      if [ -f /var/run/reboot-required.pkgs ]; then
+          pkgs=$(sort -u /var/run/reboot-required.pkgs | tr '\n' ' ')
+      fi
+
+      # /run is tmpfs, so the file's mtime is when the patch landed
+      # and the whole flag clears itself on reboot.
+      secs=$(( $(date +%s) - $(stat -c %Y /var/run/reboot-required) ))
+      if [ "$secs" -ge 86400 ]; then
+          age="$(( secs / 86400 ))d"
+      else
+          age="$(( secs / 3600 ))h"
+      fi
+
+      msg="REBOOT REQUIRED on $(hostname) - pending ${age} - ${pkgs:-package list unavailable}"
+
+      logger -t reboot-check -p daemon.warning "$msg"
+      wall "$msg" 2>/dev/null || true
+
+  - path: /etc/cron.d/reboot-check
+    permissions: '0644'
+    content: |
+      SHELL=/bin/sh
+      PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+      # 09:00 rather than right after the 02:00 patch run, so the wall
+      # broadcast lands at an hour someone might actually be logged in.
+      0 9 * * * root /usr/local/sbin/reboot-check
+
+  - path: /etc/systemd/system/apt-daily.timer.d/override.conf
+    content: |
+      [Timer]
+      OnCalendar=
+      OnCalendar=*-*-* 02:00:00
+      # Zero delay is deliberate for a single host. If this file ever
+      # provisions more than one box, restore a delay so they don't all
+      # hit the mirrors at the same instant.
+      RandomizedDelaySec=0
+      # Stock value, kept explicit. A box that was off at 02:00 runs
+      # the missed job at the next boot instead of skipping the day.
+      # The MOTD promises this.
+      Persistent=true
+
+  - path: /etc/systemd/system/apt-daily-upgrade.timer.d/override.conf
+    content: |
+      [Timer]
+      OnCalendar=
+      OnCalendar=*-*-* 02:00:00
+      # Zero delay is deliberate for a single host. If this file ever
+      # provisions more than one box, restore a delay so they don't all
+      # hit the mirrors at the same instant.
+      RandomizedDelaySec=0
+      # Stock value, kept explicit. A box that was off at 02:00 runs
+      # the missed job at the next boot instead of skipping the day.
+      # The MOTD promises this.
+      Persistent=true
